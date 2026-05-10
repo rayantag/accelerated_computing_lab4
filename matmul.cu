@@ -16,6 +16,8 @@ void cuda_check(cudaError_t code, const char *file, int line) {
     }
 }
 
+// hi
+
 #define CUDA_CHECK(x) \
     do { \
         cuda_check((x), __FILE__, __LINE__); \
