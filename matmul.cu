@@ -51,6 +51,8 @@ void cuda_check(cudaError_t code, const char *file, int line) {
 
 namespace matmul_l1 {
 
+const int TILE = 32;
+
 __global__ void matmul_l1(
     int32_t size_i,
     int32_t size_j,
@@ -59,6 +61,45 @@ __global__ void matmul_l1(
     float const *b,
     float *c) {
     /* TODO: your GPU code here */
+
+    // Declare shared memory tiles (L1 cache) for A and B.
+    // Requires size.
+    __shared__ float a_shared[TILE][TILE];
+    __shared__ float b_shared[TILE][TILE];
+
+    // Compute global (i,j) this thread is responsible for.
+    // This is the classic formula, where BlockDim = #threads per block.
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+
+    // Accumulator for this thread's output elem.
+    float sum = 0.0f;
+
+    // loop over k-tiles
+    for (int k = 0; k < size_k; k += TILE) {
+
+        // cooperatively load a TILE-wide strip of A and B into shared memory
+        // (each thread loads one element of each)
+        a_shared[tx][ty] = a[(blockIdx.x * TILE + tx) * size_k + (k + ty)];
+        b_shared[tx][ty] = b[(k + tx) * size_j + (blockIdx.y * TILE + ty)];
+
+        // wait for all threads to finish loading
+        __syncthreads();
+
+        // accumulate: dot product over the k-tile dimension
+        for (int ki = 0; ki < TILE; ++ki) {
+            sum += a_shared[tx][ki] * b_shared[ki][ty];
+        }
+
+        // wait before overwriting shared memory in the next iteration
+        __syncthreads();
+    }
+
+    // write result to global memory
+    c[i * size_j + j] = sum;
 }
 
 void launch_matmul_l1(
@@ -68,7 +109,15 @@ void launch_matmul_l1(
     float const *a,
     float const *b,
     float *c) {
-    /* TODO: your CPU code here */
+
+    // Blocks: how many threads we are using (2D, threads must cover full dims).
+    dim3 block(32, 32);
+
+    // Grid: how many blocks are we using (2D, blocks must cover full dims).
+    dim3 grid(size_i / TILE, size_j / TILE);
+
+    // Launch matmul_l1 kernel.
+    matmul_l1<<<grid, block>>>(size_i, size_j, size_k, a, b, c);
 }
 
 }; // namespace matmul_l1
