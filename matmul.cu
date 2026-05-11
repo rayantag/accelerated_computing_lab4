@@ -124,6 +124,7 @@ __global__ void matmul_l1(
     }
 
     // Write result to global memory (only time we use global i and j).
+    // Given row i, column j: C[i, j] = i * size_j + j (this is row-major).
     c[i * size_j + j] = sum;
 }
 
