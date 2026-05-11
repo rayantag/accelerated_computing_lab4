@@ -62,43 +62,68 @@ __global__ void matmul_l1(
     float *c) {
     /* TODO: your GPU code here */
 
+    // Reminders:
+    // Blocks run simultaneously across different SMs
+    // Threads run simultaneously within a block
+    // C/CUDA doesn't have native 2D arrays for dynamically sized matrices.
+    // Matrix accesses must be 1D
+
     // Declare shared memory tiles (L1 cache) for A and B.
-    // Requires size.
+    // Logically private to each block.
     __shared__ float a_shared[TILE][TILE];
     __shared__ float b_shared[TILE][TILE];
 
-    // Compute global (i,j) this thread is responsible for.
-    // This is the classic formula, where BlockDim = #threads per block.
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    // // Non-coalesced version (tx = row, ty = col):
+    // int i = blockIdx.x * blockDim.x + threadIdx.x;
+    // int j = blockIdx.y * blockDim.y + threadIdx.y;
+    // int tx = threadIdx.x;
+    // int ty = threadIdx.y;
+    // float sum = 0.0f;
+    // for (int k = 0; k < size_k; k += TILE) {
+    //     a_shared[tx][ty] = a[(blockIdx.x * TILE + tx) * size_k + (k + ty)];
+    //     b_shared[tx][ty] = b[(k + tx) * size_j + (blockIdx.y * TILE + ty)];
+    //     __syncthreads();
+    //     for (int ki = 0; ki < TILE; ++ki) {
+    //         sum += a_shared[tx][ki] * b_shared[ki][ty];
+    //     }
+    //     __syncthreads();
+    // }
+    // c[i * size_j + j] = sum;
 
-    int tx = threadIdx.x;
-    int ty = threadIdx.y;
+    // Coalesced version (tx = col, ty = row):
+    // threadIdx.x varies within a warp, so map it to the column dimension
+    // so that consecutive threads hit consecutive memory addresses.
+    int tx = threadIdx.x;  // column within tile
+    int ty = threadIdx.y;  // row within tile
+
+    // Global (i,j) this thread is responsible for.
+    int i = blockIdx.x * TILE + ty;
+    int j = blockIdx.y * TILE + tx;
 
     // Accumulator for this thread's output elem.
     float sum = 0.0f;
 
-    // loop over k-tiles
+    // Loop over K tiles.
     for (int k = 0; k < size_k; k += TILE) {
 
-        // cooperatively load a TILE-wide strip of A and B into shared memory
-        // (each thread loads one element of each)
-        a_shared[tx][ty] = a[(blockIdx.x * TILE + tx) * size_k + (k + ty)];
-        b_shared[tx][ty] = b[(k + tx) * size_j + (blockIdx.y * TILE + ty)];
+        // Cooperatively load a TILE-wide strip of A and B into shared memory (DRAM --> L1).
+        // Each thread loads one element; together all threads fill the TILExTILE tile.
+        a_shared[ty][tx] = a[(blockIdx.x * TILE + ty) * size_k + (k + tx)];
+        b_shared[ty][tx] = b[(k + ty) * size_j + (blockIdx.y * TILE + tx)];
 
-        // wait for all threads to finish loading
+        // Wait for all threads to finish loading.
         __syncthreads();
 
-        // accumulate: dot product over the k-tile dimension
+        // Accumulate dot product over the k-tile dimension (L1 --> register).
         for (int ki = 0; ki < TILE; ++ki) {
-            sum += a_shared[tx][ki] * b_shared[ki][ty];
+            sum += a_shared[ty][ki] * b_shared[ki][tx];
         }
 
-        // wait before overwriting shared memory in the next iteration
+        // Wait before overwriting shared memory in the next iteration.
         __syncthreads();
     }
 
-    // write result to global memory
+    // Write result to global memory (only time we use global i and j).
     c[i * size_j + j] = sum;
 }
 
