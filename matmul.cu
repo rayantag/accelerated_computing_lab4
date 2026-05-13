@@ -64,41 +64,23 @@ __global__ void matmul_l1(
 
     // Reminders:
     // Blocks run simultaneously across different SMs
-    // Threads run simultaneously within a block
+    // Threads run simultaneously within a block (hierarchy: block --> warp --> thread)
     // C/CUDA doesn't have native 2D arrays for dynamically sized matrices.
     // Matrix accesses must be 1D
 
-    // Declare shared memory tiles (L1 cache) for A and B.
-    // Logically private to each block.
+    // Declare shared memory tiles for A and B. They are logically private to each block
+    // because we use the L1 scratchpad for them (the L1 cache part is per-SM, not per-block).
+    // I'm told that we know only two blocks would be using this at once, so 32x32x4x2 = 16KB.
     __shared__ float a_shared[TILE][TILE];
     __shared__ float b_shared[TILE][TILE];
 
-    // // Non-coalesced version (tx = row, ty = col):
-    // int i = blockIdx.x * blockDim.x + threadIdx.x;
-    // int j = blockIdx.y * blockDim.y + threadIdx.y;
-    // int tx = threadIdx.x;
-    // int ty = threadIdx.y;
-    // float sum = 0.0f;
-    // for (int k = 0; k < size_k; k += TILE) {
-    //     a_shared[tx][ty] = a[(blockIdx.x * TILE + tx) * size_k + (k + ty)];
-    //     b_shared[tx][ty] = b[(k + tx) * size_j + (blockIdx.y * TILE + ty)];
-    //     __syncthreads();
-    //     for (int ki = 0; ki < TILE; ++ki) {
-    //         sum += a_shared[tx][ki] * b_shared[ki][ty];
-    //     }
-    //     __syncthreads();
-    // }
-    // c[i * size_j + j] = sum;
-
-    // Coalesced version (tx = col, ty = row):
-    // threadIdx.x varies within a warp, so map it to the column dimension
-    // so that consecutive threads hit consecutive memory addresses.
-    int tx = threadIdx.x;  // column within tile
-    int ty = threadIdx.y;  // row within tile
-
     // Global (i,j) this thread is responsible for.
-    int i = blockIdx.x * TILE + ty;
-    int j = blockIdx.y * TILE + tx;
+    int global_col = blockIdx.x * blockDim.x + threadIdx.x;
+    int global_row = blockIdx.y * blockDim.y + threadIdx.y;
+
+    // Local thread within the block.
+    int local_col = threadIdx.x;
+    int local_row = threadIdx.y;
 
     // Accumulator for this thread's output elem.
     float sum = 0.0f;
@@ -106,17 +88,27 @@ __global__ void matmul_l1(
     // Loop over K tiles.
     for (int k = 0; k < size_k; k += TILE) {
 
-        // Cooperatively load a TILE-wide strip of A and B into shared memory (DRAM --> L1).
+        // Cooperatively load a TILE-wide strip of A and B into shared memory (DRAM --> L1 via L2).
         // Each thread loads one element; together all threads fill the TILExTILE tile.
-        a_shared[ty][tx] = a[(blockIdx.x * TILE + ty) * size_k + (k + tx)];
-        b_shared[ty][tx] = b[(k + ty) * size_j + (blockIdx.y * TILE + tx)];
+        // At one timestep, [a,b]_shared are block-specific, so therefore use local row/col.
+        // But [a,b]_shared will end up spanning the whole k dim!
+
+        // a_shared: fixed row, varies by column (k-dim).
+        // get global row offset: global_row * size_k
+        // get global col: k + local_col
+        a_shared[local_row][local_col] = a[global_row * size_k + (k + local_col)];
+
+        // b_shared: varied row (k_dim), fixed column.
+        // get global row offset: (k + local_row) * size_j
+        // get global col offset: global_col
+        b_shared[local_row][local_col] = b[(k + local_row) * size_j + global_col];
 
         // Wait for all threads to finish loading.
         __syncthreads();
 
         // Accumulate dot product over the k-tile dimension (L1 --> register).
         for (int ki = 0; ki < TILE; ++ki) {
-            sum += a_shared[ty][ki] * b_shared[ki][tx];
+            sum += a_shared[local_row][ki] * b_shared[ki][local_col];
         }
 
         // Wait before overwriting shared memory in the next iteration.
@@ -125,7 +117,7 @@ __global__ void matmul_l1(
 
     // Write result to global memory (only time we use global i and j).
     // Given row i, column j: C[i, j] = i * size_j + j (this is row-major).
-    c[i * size_j + j] = sum;
+    c[global_row * size_j + global_col] = sum;
 }
 
 void launch_matmul_l1(
@@ -137,6 +129,7 @@ void launch_matmul_l1(
     float *c) {
 
     // Blocks: how many threads we are using (2D, threads must cover full dims).
+    // This is what ThreadIdx.x and ThreadIdx.y are local to!! They go from (0-31).
     dim3 block(32, 32);
 
     // Grid: how many blocks are we using (2D, blocks must cover full dims).
