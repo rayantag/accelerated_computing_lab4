@@ -146,8 +146,6 @@ void launch_matmul_l1(
 
 namespace matmul_l1_reg {
 
-namespace matmul_l1_reg {
-
 // These need to be compile-time constatns, otherwise you'll get something like:
 // note: the value of variable "matmul_l1_reg::microtile_dim" cannot be used as a constant
 
