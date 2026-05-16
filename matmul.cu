@@ -150,7 +150,11 @@ namespace matmul_l1_reg {
 // note: the value of variable "matmul_l1_reg::microtile_dim" cannot be used as a constant
 
 // This is what gets loaded into L1: 128x128 block (4 bytes/elem).
+// block_dim tiles the output (i and j dimensions), how much of C each block owns.
 constexpr auto block_dim = 128;
+
+// k_tile tiles the reduction (k-dimension) -- determines how much of the dot prod is computed per iteration.
+constexpr auto k_tile = 64;
 
 // Each thread owns an 8x8 microtile.
 constexpr auto microtile_dim = 8;
@@ -169,8 +173,9 @@ __global__ void matmul_l1_reg(
     // 64 KB memory per warp scheduler. 256 KB per SM (4 warp schedulers per SM)
 
     // Want to load 128x128 tiles at a time.
-    __shared__ float a_shared[block_dim][block_dim];
-    __shared__ float b_shared[block_dim][block_dim];
+    // Want to load 128x64 and 64x128 tiles at a time.
+    __shared__ float a_shared[block_dim][k_tile];
+    __shared__ float b_shared[k_tile][block_dim];
 
     // Local thread within the block.
     int local_col = threadIdx.x;
@@ -183,7 +188,7 @@ __global__ void matmul_l1_reg(
     float c_sums[8][8];
 
     // Advance shared tile along k-dim, increment by block size.
-    for (int k = 0; k < size_k; k += block_dim) {
+    for (int k = 0; k < size_k; k += k_tile) {
         
         // Load 128xk_tile of A and k_tile of B into shared mem cooperatively.
         // Here, each thread is responsible for 64 elements.
@@ -202,7 +207,7 @@ __global__ void matmul_l1_reg(
         }
         __syncthreads();
         float a_reg[8], b_reg[8];
-        for (int ki = 0; ki < block_dim; ki++) {
+        for (int ki = 0; ki < k_tile; ki++) {
             for (int row = 0; row < microtile_dim; row++) {
                 a_reg[row] = a_shared[local_row+row][ki];
             }
