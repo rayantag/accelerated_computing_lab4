@@ -146,6 +146,20 @@ void launch_matmul_l1(
 
 namespace matmul_l1_reg {
 
+namespace matmul_l1_reg {
+
+// These need to be compile-time constatns, otherwise you'll get something like:
+// note: the value of variable "matmul_l1_reg::microtile_dim" cannot be used as a constant
+
+// This is what gets loaded into L1: 128x128 block (4 bytes/elem).
+constexpr auto block_dim = 128;
+
+// Each thread owns an 8x8 microtile.
+constexpr auto microtile_dim = 8;
+
+// Threads per block.
+constexpr auto threads_per_block_dim = block_dim / microtile_dim;
+
 __global__ void matmul_l1_reg(
     int32_t size_i,
     int32_t size_j,
@@ -154,6 +168,63 @@ __global__ void matmul_l1_reg(
     float const *b,
     float *c) {
     /* TODO: your GPU code here */
+    // 64 KB memory per warp scheduler. 256 KB per SM (4 warp schedulers per SM)
+
+    // Want to load 128x128 tiles at a time.
+    __shared__ float a_shared[block_dim][block_dim];
+    __shared__ float b_shared[block_dim][block_dim];
+
+    // Local thread within the block.
+    int local_col = threadIdx.x;
+    int local_row = threadIdx.y;
+
+    // Global indices for the thread.
+    int global_col = blockIdx.x * blockDim.x + local_col;
+    int global_row = blockIdx.y * blockDim.y + local_row;
+
+    float c_sums[8][8];
+
+    // Advance shared tile along k-dim, increment by block size.
+    for (int k = 0; k < size_k; k += block_dim) {
+        
+        // Load 128xk_tile of A and k_tile of B into shared mem cooperatively.
+        // Here, each thread is responsible for 64 elements.
+        for (int row = 0; row < microtile_dim; row += 1) {
+            for (int col = 0; col < microtile_dim; col += 1) {
+
+                // A: row is fixed (global row * size_k to actually get to the first elem), col (k-dim) varies.
+                a_shared[local_row + row][local_col + col] = a[(global_row + row) * size_k + k + local_col + col];
+
+                // B: col is fixed, row varies.
+                // Get to specific row within block: k + local_row + row
+                // Get to that actual element byte: (k + local_row + row) * size_j
+                // Col: global_col + col
+                b_shared[local_row + row][local_col + col] = b[(k + local_row + row) * size_j + global_col + col];
+            }
+        }
+        __syncthreads();
+        float a_reg[8], b_reg[8];
+        for (int ki = 0; ki < block_dim; ki++) {
+            for (int row = 0; row < microtile_dim; row++) {
+                a_reg[row] = a_shared[local_row+row][ki];
+            }
+            for (int col = 0; col < microtile_dim; col++) {
+                b_reg[col] = b_shared[ki][local_col + col];
+            }
+            for (int row = 0; row < microtile_dim; row++) {
+                for (int col = 0; col < microtile_dim; col++) {
+                    c_sums[row][col] += (a_reg[row] * b_reg[col]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+    // Write register accumulators to global C.
+    for (int row = 0; row < microtile_dim; row++) {
+        for (int col = 0; col < microtile_dim; col++) {
+            c[(global_row + row) * size_j + (global_col + col)] = c_sums[row][col];
+        }
+    }
 }
 
 void launch_matmul_l1_reg(
@@ -164,6 +235,16 @@ void launch_matmul_l1_reg(
     float const *b,
     float *c) {
     /* TODO: your CPU code here */
+    
+    // This notation specifies the thread layout within the block.
+    // Note: regardless of the layout, warps are always 32 threads.
+    dim3 block(threads_per_block_dim, threads_per_block_dim);
+
+    // This specifies the block layout within the grid.
+    dim3 grid(size_i / block_dim, size_j / block_dim);
+
+    // Launch!
+    matmul_l1_reg<<<grid, block>>>(size_i, size_j, size_k, a, b, c);
 }
 
 }; // namespace matmul_l1_reg
