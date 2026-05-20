@@ -154,7 +154,7 @@ namespace matmul_l1_reg {
 constexpr auto block_dim = 128;
 
 // k_tile tiles the reduction (k-dimension) -- determines how much of the dot prod is computed per iteration.
-constexpr auto k_tile = 64;
+constexpr auto k_tile = 32;
 
 // Each thread owns an 8x8 microtile.
 constexpr auto microtile_dim = 8;
@@ -181,53 +181,57 @@ __global__ void matmul_l1_reg(
     int local_col = threadIdx.x;
     int local_row = threadIdx.y;
 
-    // Global indices for the thread.
-    int global_col = blockIdx.x * blockDim.x + local_col;
-    int global_row = blockIdx.y * blockDim.y + local_row;
-
-    float c_sums[8][8];
+    // k-dimension elements each thread is responsible for loading (A cols, B rows).
+    constexpr int k_per_thread = k_tile / threads_per_block_dim;
 
     // Advance shared tile along k-dim, increment by block size.
+    float c_sums[8][8] = {};
+
     for (int k = 0; k < size_k; k += k_tile) {
-        
-        // Load 128xk_tile of A and k_tile of B into shared mem cooperatively.
-        // Here, each thread is responsible for 64 elements.
-        for (int row = 0; row < microtile_dim; row += 1) {
-            for (int col = 0; col < microtile_dim; col += 1) {
 
-                // A: row is fixed (global row * size_k to actually get to the first elem), col (k-dim) varies.
-                a_shared[local_row + row][local_col + col] = a[(global_row + row) * size_k + k + local_col + col];
+        // Load 128xk_tile of A into shared mem cooperatively.
+        // A: row (i-dim) is fixed per thread group, col (k-dim) varies.
+        // Each thread covers microtile_dim i-rows and k_per_thread k-cols.
+        // get global row: blockIdx.y * block_dim + local_row * microtile_dim + row
+        // get global col: k + local_col * k_per_thread + col
+        for (int row = 0; row < microtile_dim; row++)
+            for (int col = 0; col < k_per_thread; col++)
+                a_shared[local_row * microtile_dim + row][local_col * k_per_thread + col] =
+                    a[(blockIdx.y * block_dim + local_row * microtile_dim + row) * size_k
+                      + k + local_col * k_per_thread + col];
 
-                // B: col is fixed, row varies.
-                // Get to specific row within block: k + local_row + row
-                // Get to that actual element byte: (k + local_row + row) * size_j
-                // Col: global_col + col
-                b_shared[local_row + row][local_col + col] = b[(k + local_row + row) * size_j + global_col + col];
-            }
-        }
+        // Load k_tilex128 of B into shared mem cooperatively.
+        // B: col (j-dim) is fixed per thread group, row (k-dim) varies.
+        // Each thread covers k_per_thread k-rows and microtile_dim j-cols.
+        // get global row: k + local_row * k_per_thread + row
+        // get global col: blockIdx.x * block_dim + local_col * microtile_dim + col
+        for (int row = 0; row < k_per_thread; row++)
+            for (int col = 0; col < microtile_dim; col++)
+                b_shared[local_row * k_per_thread + row][local_col * microtile_dim + col] =
+                    b[(k + local_row * k_per_thread + row) * size_j
+                      + blockIdx.x * block_dim + local_col * microtile_dim + col];
+
         __syncthreads();
+
         float a_reg[8], b_reg[8];
         for (int ki = 0; ki < k_tile; ki++) {
-            for (int row = 0; row < microtile_dim; row++) {
-                a_reg[row] = a_shared[local_row+row][ki];
-            }
-            for (int col = 0; col < microtile_dim; col++) {
-                b_reg[col] = b_shared[ki][local_col + col];
-            }
-            for (int row = 0; row < microtile_dim; row++) {
-                for (int col = 0; col < microtile_dim; col++) {
-                    c_sums[row][col] += (a_reg[row] * b_reg[col]);
-                }
-            }
+            for (int row = 0; row < microtile_dim; row++)
+                a_reg[row] = a_shared[local_row * microtile_dim + row][ki];
+            for (int col = 0; col < microtile_dim; col++)
+                b_reg[col] = b_shared[ki][local_col * microtile_dim + col];
+            for (int row = 0; row < microtile_dim; row++)
+                for (int col = 0; col < microtile_dim; col++)
+                    c_sums[row][col] += a_reg[row] * b_reg[col];
         }
+
         __syncthreads();
     }
+
     // Write register accumulators to global C.
-    for (int row = 0; row < microtile_dim; row++) {
-        for (int col = 0; col < microtile_dim; col++) {
-            c[(global_row + row) * size_j + (global_col + col)] = c_sums[row][col];
-        }
-    }
+    for (int row = 0; row < microtile_dim; row++)
+        for (int col = 0; col < microtile_dim; col++)
+            c[(blockIdx.y * block_dim + local_row * microtile_dim + row) * size_j
+              + blockIdx.x * block_dim + local_col * microtile_dim + col] = c_sums[row][col];
 }
 
 void launch_matmul_l1_reg(
@@ -248,6 +252,10 @@ void launch_matmul_l1_reg(
 
     // Launch!
     matmul_l1_reg<<<grid, block>>>(size_i, size_j, size_k, a, b, c);
+    
+    // For debugging:
+    // CUDA_CHECK(cudaGetLastError());       // catches launch errors (bad params, OOM shmem)
+    // CUDA_CHECK(cudaDeviceSynchronize());  // catches runtime errors (illegal mem access, etc.)
 }
 
 }; // namespace matmul_l1_reg
